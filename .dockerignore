@@ -6,7 +6,13 @@ dist
 .env.example
 *.log
 .DS_Store
-node_modules/
 
 # Don't skip server/ or config/ in Docker build
-# They are needed at runtime
+# They are needed at runtime.
+
+# Container-written runtime state (root-owned; breaks context read otherwise)
+config/bench-active.json
+config/prefill-bench-active.json
+config/fleet-energy.json
+config/llm-daily.json
+config/ssh/

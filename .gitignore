@@ -28,3 +28,5 @@ HANDOFF.md
 HANDOFF-HERMES.md
 handoff.md
 test/
+ssh-only
+config/ssh/

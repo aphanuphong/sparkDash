@@ -191,7 +191,26 @@ export interface GpuThrottle {
   detail: string;
 }
 
+/** One physical GPU device of a multi-GPU unit. */
+export interface GpuDevice {
+  /** nvidia-smi device index (0-based, stable per boot). */
+  index: number;
+  temperature: number;
+  usage: number;
+  power: { draw: number; limit: number };
+  /** Discrete-card VRAM; null when this card reports through the shared pool (GB10). */
+  vram: {
+    used: number;
+    total: number;
+    percentage: number;
+    available: number;
+  } | null;
+  throttle?: GpuThrottle | null;
+}
+
 export interface GpuMetrics {
+  /** Per-device detail. Present (possibly length 1) on healthy multi-GPU boxes. */
+  gpus?: GpuDevice[] | null;
   temperature: number;
   usage: number;
   power: {

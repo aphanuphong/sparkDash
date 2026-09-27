@@ -1,4 +1,4 @@
-import type { CpuMetrics, GpuMetrics } from "../../api/types";
+import type { CpuMetrics, GpuDevice, GpuMetrics } from "../../api/types";
 import { Sparkline } from "../ui/Sparkline";
 import { Panel } from "../ui/Panel";
 import { ActivityIcon } from "../ui/icons";
@@ -18,6 +18,11 @@ function celsiusToFahrenheit(c: number): number {
   return Math.round(c * 9 / 5 + 32);
 }
 
+
+function formatWatts(w: number): string {
+  const n = Number(w);
+  return (Number.isFinite(n) ? n : 0).toFixed(2);
+}
 function formatMb(mb: number): string {
   if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GB`;
   return `${Math.round(mb)} MB`;
@@ -41,6 +46,59 @@ function MetricRow({
         <span style={{ color }}>{spark}</span>
         <span className="font-tabular text-sm font-semibold text-text">{value}</span>
       </div>
+    </div>
+  );
+}
+
+/** Per-device summary row for multi-GPU units (usage/temp, per-card history). */
+function DeviceRow({
+  device,
+  sparkId,
+  temperatureUnit,
+}: {
+  device: GpuDevice;
+  sparkId: string;
+  temperatureUnit: "celsius" | "fahrenheit";
+}) {
+  const usageHistory = useMetricsHistoryTail(sparkId, `gpu${device.index}.usage`);
+  const tempHistory = useMetricsHistoryTail(sparkId, `gpu${device.index}.temp`);
+  const temperature = device.temperature;
+  const displayTemp = temperatureUnit === "fahrenheit" ? celsiusToFahrenheit(temperature) : temperature;
+  const tempLabel = temperatureUnit === "fahrenheit" ? `${displayTemp}°F` : `${displayTemp}°C`;
+  const tempColor =
+    temperature > 85
+      ? "var(--color-danger)"
+      : temperature > 65
+        ? "var(--color-warning)"
+        : "var(--color-accent)";
+  return (
+    <div className="space-y-1 rounded-md border border-border bg-surface-elevated px-2 py-1.5">
+      <div className="flex items-center justify-between text-xs">
+        <span className="font-semibold text-text">GPU {device.index}</span>
+        <span className="font-tabular text-[10px] text-muted">
+          {formatWatts(device.power.draw)}W / {device.power.limit}W
+        </span>
+      </div>
+      <MetricRow
+        label="Usage"
+        color="var(--color-accent)"
+        spark={<Sparkline data={usageHistory} color="var(--color-accent)" width={140} />}
+        value={<span className="text-text-strong">{device.usage}%</span>}
+      />
+      <MetricRow
+        label="Temp"
+        color={tempColor}
+        spark={<Sparkline data={tempHistory} color={tempColor} width={140} />}
+        value={<span className="text-text-strong">{tempLabel}</span>}
+      />
+      {device.vram && (
+        <div className="flex justify-between text-xs">
+          <span className="text-muted">VRAM</span>
+          <span className="font-tabular text-text">
+            {formatMb(device.vram.used)} / {formatMb(device.vram.total)}
+          </span>
+        </div>
+      )}
     </div>
   );
 }
@@ -112,7 +170,7 @@ export function GpuPanel({ gpu, cpu, sparkId, temperatureUnit, className }: GpuP
       <div className="flex justify-between text-sm">
         <span className="text-muted">GPU Power</span>
         <span className="font-tabular text-sm text-text">
-          {powerDraw}W / {powerLimit}W
+          {formatWatts(powerDraw)}W / {powerLimit}W
         </span>
       </div>
 
@@ -172,6 +230,21 @@ export function GpuPanel({ gpu, cpu, sparkId, temperatureUnit, className }: GpuP
           </div>
         );
       })()}
+
+      {/* Multi-GPU: per-device breakdown when the unit exposes more than one card. */}
+      {(gpu?.gpus?.length ?? 0) > 1 && (
+        <div className="space-y-1.5 border-t border-border pt-3">
+          <div className="text-[10px] uppercase tracking-wide text-muted">Devices</div>
+          {gpu!.gpus!.map((device) => (
+            <DeviceRow
+              key={device.index}
+              device={device}
+              sparkId={sparkId}
+              temperatureUnit={temperatureUnit}
+            />
+          ))}
+        </div>
+      )}
 
       {/* GPU-allocated memory (portion of the unified pool held by GPU compute apps) */}
       {gpu && (
