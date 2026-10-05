@@ -282,7 +282,7 @@ function SparkCard({
           <div className="mt-4 grid grid-cols-2 gap-x-4 gap-y-2.5 border-t border-border pt-3.5">
             <MiniStat
               label="GPU Power"
-              value={`${gpu?.power?.draw ?? 0}W / ${gpu?.power?.limit ?? 0}W`}
+              value={`${(gpu?.power?.draw ?? 0).toFixed(2)}W / ${gpu?.power?.limit ?? 0}W`}
             />
             {vramAvail > 0 && (
               <MiniStat
@@ -351,7 +351,9 @@ function SparkCard({
                             ? "EXL3"
                             : llm.backend === "q27"
                               ? "q27"
-                              : llm.backend ?? "LLM"
+                              : llm.backend === "dgpp"
+                                ? "DGPP"
+                                : llm.backend ?? "LLM"
                   }
                   value={llm.modelId ?? "unknown"}
                   tone="accent"

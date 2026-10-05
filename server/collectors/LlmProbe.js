@@ -66,7 +66,7 @@ export class LlmProbe {
     this.baseUrl = `http://${llmProbeHost(spark)}:${port}`;
 
     // State
-    this.backendType = null; // 'vllm' | 'llama.cpp' | 'sglang' | 'ds4' | 'exl3' | 'q27' | null
+    this.backendType = null; // 'vllm' | 'llama.cpp' | 'sglang' | 'ds4' | 'exl3' | 'q27' | 'dgpp' | null
     this.serverIsOpenAI = null; // true = OpenAI-compatible
     /** Whether /v1/models (or /slots) answered without credentials. null = unknown. */
     this.authOpen = null;
@@ -96,6 +96,9 @@ export class LlmProbe {
     this.lastTtftCount = null;
     /** Previous `vllm:iteration_tokens_total_sum` (engine-step tokens). */
     this.lastIterSum = null;
+    /** DGPP TTFT running totals (ms) recombined from prefix_cache hit/miss ms-averages. */
+    this.lastDgppTtftSumMs = null;
+    this.lastDgppTtftCount = null;
     this.lastProbeTime = 0;
 
     // Cumulative total output tokens (generation) as reported by the LLM server
@@ -269,6 +272,8 @@ export class LlmProbe {
     this.lastTtftSum = null;
     this.lastTtftCount = null;
     this.lastIterSum = null;
+    this.lastDgppTtftSumMs = null;
+    this.lastDgppTtftCount = null;
     this._sglangStickyTps = null;
     this._sglangLoadGenTps = null;
   }
@@ -298,7 +303,8 @@ export class LlmProbe {
       this.backendType !== "sglang" &&
       this.backendType !== "ds4" &&
       this.backendType !== "exl3" &&
-      this.backendType !== "q27"
+      this.backendType !== "q27" &&
+      this.backendType !== "dgpp"
     ) {
       const slotUrl = `${this.baseUrl}/slots`;
       try {
@@ -345,9 +351,9 @@ export class LlmProbe {
   }
 
   /**
-   * Classify an OpenAI-compatible server: ds4, SGLang, EXL3, q27, or vLLM (default).
+   * Classify an OpenAI-compatible server: ds4, SGLang, EXL3, q27, DGPP, or vLLM (default).
    * @param {unknown} ownedBy
-   * @returns {Promise<"ds4" | "sglang" | "exl3" | "q27" | "vllm">}
+   * @returns {Promise<"ds4" | "sglang" | "exl3" | "q27" | "dgpp" | "vllm">}
    */
   async _classifyOpenAIBackend(ownedBy) {
     if (typeof ownedBy === "string") {
@@ -356,8 +362,25 @@ export class LlmProbe {
       if (/exl3/i.test(ownedBy)) return "exl3";
       // q27's /v1/models reports owned_by: "q27" (signalnine/q27 engine).
       if (/q27/i.test(ownedBy)) return "q27";
+      // DGPP dgpp-serve reports owned_by: "dgpp".
+      if (/dgpp/i.test(ownedBy)) return "dgpp";
     }
-    if (await this._probeIsDs4()) return "ds4";
+    // One /metrics fetch feeds ds4/vLLM detection. A vLLM-flavoured
+    // exposition is positive evidence; skip SGLang /server_info and
+    // /get_server_info probes entirely (steady 404 pair otherwise).
+    let metricsText = null;
+    try {
+      const metricsRes = await this._fetch(`${this.baseUrl}/metrics`);
+      if (metricsRes.ok) metricsText = await metricsRes.text();
+    } catch {
+      /* metrics optional */
+    }
+    if (metricsText != null) {
+      if (LlmProbe._metricsLookLikeDs4(metricsText)) return "ds4";
+      if (LlmProbe._metricsLookLikeVllm(metricsText)) return "vllm";
+    } else if (await this._probeIsDs4()) {
+      return "ds4";
+    }
     if (await this._probeIsSglang()) return "sglang";
     if (await this._probeIsExl3()) return "exl3";
     if (await this._probeIsQ27()) return "q27";
@@ -428,6 +451,12 @@ export class LlmProbe {
     return /(?:^|\n)ds4_tokens_decoded_total(?:\{|\s)/m.test(String(body || ""));
   }
 
+  /** Positive vLLM evidence: Prometheus exposition exposes `vllm:` series.
+   *  Used to skip SGLang server_info probes against vLLM (404 spam otherwise). */
+  static _metricsLookLikeVllm(body) {
+    return /(?:^|\n)vllm:[a-zA-Z_:]+(?:\{|\s)/m.test(String(body || ""));
+  }
+
   /** True when Prometheus /metrics exposes q27-series (signalnine/q27 engine). */
   async _probeIsQ27() {
     try {
@@ -489,7 +518,28 @@ export class LlmProbe {
         this.backendType = "sglang";
       } else if (/exl3/i.test(owned) && this.backendType !== "ds4") {
         this.backendType = "exl3";
+      } else if (/dgpp/i.test(owned)) {
+        this.backendType = "dgpp";
       }
+    }
+
+    // DGPP: JSON /metrics (scheduler/service/prefix_cache). Fetch + apply here
+    // so it never touches the SGLang server_info probes (404 pair otherwise).
+    if (this.backendType === "dgpp") {
+      let dgppData = null;
+      try {
+        const mRes = await this._fetch(`${this.baseUrl}/metrics`);
+        if (mRes.ok) {
+          dgppData = await mRes.json().catch(() => null);
+          if (!dgppData || typeof dgppData !== "object") dgppData = null;
+        }
+      } catch {
+        /* metrics optional */
+      }
+      if (dgppData) this._applyDgppMetrics(dgppData, dtSec);
+      // Weights resident, no sleep state — ready whenever the server answers.
+      if (this.gpuMemoryUtilization == null) this.gpuMemoryUtilization = 1;
+      return this._getSnapshot();
     }
 
     // EXL3 serve_openai.py: live tok/s from /health cumulative counters (no Prometheus).
@@ -574,7 +624,8 @@ export class LlmProbe {
       } else if (
         this.backendType !== "ds4" &&
         this.backendType !== "exl3" &&
-        this.backendType !== "q27"
+        this.backendType !== "q27" &&
+        this.backendType !== "dgpp"
       ) {
         this.backendType = "vllm";
       }
@@ -582,7 +633,8 @@ export class LlmProbe {
       if (
         this.backendType !== "ds4" &&
         this.backendType !== "exl3" &&
-        this.backendType !== "q27"
+        this.backendType !== "q27" &&
+        this.backendType !== "dgpp"
       ) {
         this.backendType = "vllm";
       }
@@ -931,6 +983,103 @@ export class LlmProbe {
     this.mtpAcceptanceRate =
       mtpAccepted != null && mtpDrafted != null && mtpDrafted > 0
         ? Math.round((mtpAccepted / mtpDrafted) * 10000) / 10000
+        : null;
+  }
+
+  /**
+   * Apply DGPP (dgpp-serve) JSON /metrics.
+   *
+   * DGPP exposes /metrics as application/json, not Prometheus text:
+   * { scheduler, service, latency, prefix_cache, prefill }. Live tok/s from
+   * cumulative counter deltas so idle → 0. The prefill tile counts COMPUTED
+   * tokens only (ds4/q27 convention); the token-based cached/computed split
+   * doubles as the prefix-cache hit rate. No TTFT/E2E/ITL histograms exist,
+   * so those p95 tiles stay null ("—"); TTFT is the live window mean from
+   * the prefix_cache ttft hit/miss ms-averages.
+   * @param {Record<string, unknown>} d
+   * @param {number} dtSec
+   */
+  _applyDgppMetrics(d, dtSec) {
+    const sched = d?.scheduler || {};
+    const spec = sched.spec_decode || {};
+    const pfx = d?.prefix_cache || {};
+
+    const gen = Number(sched.tokens_generated);
+    const computed = Number(sched.prompt_tokens_computed);
+    const prompted = Number(sched.prompt_tokens);
+    if (Number.isFinite(gen) && Number.isFinite(computed)) {
+      if (dtSec > 0 && dtSec < 10) {
+        const deltaOut = gen - this.lastTokenCounts.output;
+        const deltaIn = computed - this.lastTokenCounts.input;
+        this.generationTps = Math.max(0, Math.round((deltaOut / dtSec) * 100) / 100);
+        this.prefillTps = Math.max(0, Math.round((deltaIn / dtSec) * 100) / 100);
+      }
+      this.lastTokenCounts.input = computed;
+      this.lastTokenCounts.output = gen;
+      this.totalOutputTokens = gen;
+    }
+
+    // Live cached vs computed prefill split (cached = prompt tokens served from
+    // the prefix cache). Also yields prefixCacheHitRate via _setPrefillSplitRates.
+    this._setPrefillSplitRates(
+      Number.isFinite(prompted) && Number.isFinite(computed)
+        ? Math.max(0, prompted - computed)
+        : null,
+      Number.isFinite(computed) ? computed : null,
+      dtSec
+    );
+
+    const active = Number(sched.active);
+    const queued = Number(sched.queued);
+    this.requestsRunning = Number.isFinite(active) ? active : null;
+    this.requestsWaiting = Number.isFinite(queued) ? queued : null;
+    if (this.requestsRunning != null) this.slotsActive = Math.round(this.requestsRunning);
+
+    const poolTotal = Number(sched.pool_blocks_total);
+    const poolUsed = Number(sched.pool_blocks_in_use);
+    this.kvCacheUsage =
+      Number.isFinite(poolTotal) && poolTotal > 0 && Number.isFinite(poolUsed)
+        ? Math.round((poolUsed / poolTotal) * 10000) / 10000
+        : null;
+
+    // Live mean TTFT over the recent window: prefix_cache ttft hit/miss
+    // counters carry per-kind ms averages — recombine into running totals.
+    const hitCount = Number(pfx.ttft_hit_count);
+    const missCount = Number(pfx.ttft_miss_count);
+    const ttftTotal = hitCount + missCount;
+    if (Number.isFinite(ttftTotal) && ttftTotal > 0) {
+      const sumMs =
+        Number(pfx.ttft_hit_ms_avg || 0) * hitCount +
+        Number(pfx.ttft_miss_ms_avg || 0) * missCount;
+      if (this.lastDgppTtftCount != null && this.lastDgppTtftSumMs != null) {
+        const dCount = ttftTotal - this.lastDgppTtftCount;
+        const dSum = sumMs - this.lastDgppTtftSumMs;
+        this.ttftSeconds =
+          dCount > 0 && dSum >= 0
+            ? Math.round((dSum / dCount / 1000) * 1000) / 1000
+            : null;
+      } else {
+        this.ttftSeconds = null;
+      }
+      this.lastDgppTtftCount = ttftTotal;
+      this.lastDgppTtftSumMs = sumMs;
+    } else {
+      this.ttftSeconds = null;
+      this.lastDgppTtftCount = null;
+      this.lastDgppTtftSumMs = null;
+    }
+    this.ttftP95Seconds = null;
+    this.e2eP95Seconds = null;
+    this.itlP95Seconds = null;
+    // No preemption counter in DGPP (admission shed is a different concept).
+    this.preemptionsTotal = null;
+
+    // Spec-decode acceptance rate (accepted/drafted), like the vLLM/q27 tile.
+    const accepted = Number(spec.num_accepted_tokens_total);
+    const drafted = Number(spec.num_draft_tokens_total);
+    this.mtpAcceptanceRate =
+      Number.isFinite(accepted) && Number.isFinite(drafted) && drafted > 0
+        ? Math.round((accepted / drafted) * 10000) / 10000
         : null;
   }
 

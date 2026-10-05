@@ -32,8 +32,6 @@ services:
       - /sys:/host/sys:ro
       - /:/host/root:ro
       # Mount nvidia-smi + driver libs (fallback if nsenter host path fails)
-      - /usr/bin/nvidia-smi:/usr/bin/nvidia-smi:ro
-      - /usr/lib/aarch64-linux-gnu/libnvidia-ml.so.1:/usr/lib/aarch64-linux-gnu/libnvidia-ml.so.1:ro
       # Config + encrypted secrets (passwords survive restarts)
       - ./config:/app/config
       # Remote Sparks with SSH *key* auth: OpenSSH inside the container uses
@@ -41,7 +39,7 @@ services:
       # default-named key (id_ed25519 / id_rsa). A custom name like
       # id_ed25519_shared must be mounted *as* id_ed25519, or set
       # SSH_IDENTITY_FILE to the path inside the container.
-      # - ${HOME}/.ssh/id_ed25519:/root/.ssh/id_ed25519:ro
+      - ./config/ssh/id_ed25519:/root/.ssh/id_ed25519:ro
     environment:
       # Secure default: host-networked service listens only on loopback.
       # See docs/REMOTE-ACCESS.md; direct non-loopback binds fail closed.
@@ -49,6 +47,9 @@ services:
       - SPARKDASH_TOKEN=${SPARKDASH_TOKEN:-}
       - SPARKDASH_ALLOW_OPEN_REMOTE=${SPARKDASH_ALLOW_OPEN_REMOTE:-1}
       - PORT=5555
+      # LLM probe cadence. 2s default hammers /health + /metrics on every
+      # serving box; 5s is plenty for dashboard tiles and kills the log noise.
+      - POLL_INTERVAL_LLM=${POLL_INTERVAL_LLM:-5000}
       - LLM_PORT=8888
       - NODE_ENV=production
       - HOST_PROC_PATH=/host/proc

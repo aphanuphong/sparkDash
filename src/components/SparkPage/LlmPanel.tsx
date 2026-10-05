@@ -280,6 +280,7 @@ function BackendBadge({ backend }: { backend: string | null }) {
     ds4: "ds4",
     exl3: "EXL3",
     q27: "q27",
+    dgpp: "DGPP",
   };
 
   return (
@@ -859,7 +860,10 @@ export function LlmPanel({
             </div>
           </div>
 
-          {llm && (llm.backend === "vllm" || llm.backend === "q27") && (
+          {llm &&
+            (llm.backend === "vllm" ||
+              llm.backend === "q27" ||
+              llm.backend === "dgpp") && (
             <div className="grid grid-cols-2 gap-2 border-t border-border pt-3 sm:grid-cols-4">
               <div className="space-y-0.5">
                 <MetricInfoTip
@@ -934,7 +938,10 @@ export function LlmPanel({
             </div>
           )}
 
-          {llm && (llm.backend === "vllm" || llm.backend === "q27") && (
+          {llm &&
+            (llm.backend === "vllm" ||
+              llm.backend === "q27" ||
+              llm.backend === "dgpp") && (
             <div className="grid grid-cols-2 gap-2 border-t border-border pt-3 sm:grid-cols-4">
               <div className="space-y-0.5">
                 <MetricInfoTip

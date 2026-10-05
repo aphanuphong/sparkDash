@@ -215,8 +215,10 @@ export class SystemCollector {
     const gpuOut = await this._nvidiaSmi(
       "--query-gpu=temperature.gpu,utilization.gpu,power.draw,power.limit,clocks.current.sm,clocks.max.sm,clocks_throttle_reasons.hw_thermal_slowdown,clocks_throttle_reasons.sw_thermal_slowdown,clocks_throttle_reasons.hw_slowdown,clocks_throttle_reasons.sw_power_cap --format=csv,noheader,nounits"
     );
-    const gpu = this._parseGpuLine(gpuOut);
-    const vram = await this._queryNvidiaVram();
+    const gpuLines = this._parseGpuLinesAll(gpuOut);
+    const gpu = this._aggregateGpuLines(gpuLines);
+    const vram = await this._queryNvidiaVram(); // populates this._lastVramLines
+    const gpus = this._assembleGpuArray(gpuLines, this._lastVramLines ?? []);
 
     // Estimate total system power: GPU draw + CPU draw + ~20W CX7/peripherals
     let systemDraw = gpu.powerDraw;
@@ -238,6 +240,7 @@ export class SystemCollector {
       usage: gpu.usage,
       power: { draw: gpu.powerDraw, limit: gpu.powerLimit, systemDraw },
       vram,
+      gpus,
       processes,
       throttle: gpu.throttle,
       nvErrNoMemory: await this._nvErrNoMemory(),
@@ -263,16 +266,41 @@ export class SystemCollector {
     let total = null;
     let availableMB = 0;
 
+    let vramLines = [];
     try {
       const memOut = await this._nvidiaSmi(
         "--query-gpu=memory.used,memory.total --format=csv,noheader,nounits"
       );
-      const line = memOut.trim().split("\n").filter(Boolean)[0] || "";
-      const parts = line.split(",").map((s) => s.trim());
-      used = this._parseSmiNumber(parts[0]);
-      total = this._parseSmiNumber(parts[1]);
+      vramLines = memOut
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => {
+          const p = line.split(",").map((s) => s.trim());
+          return { used: this._parseSmiNumber(p[0]), total: this._parseSmiNumber(p[1]) };
+        });
     } catch {
       /* memory.* often N/A on GB10 */
+    }
+    this._lastVramLines = vramLines;
+    if (vramLines.length === 1) {
+      used = vramLines[0].used;
+      total = vramLines[0].total;
+    } else if (vramLines.length > 1) {
+      // Multi-GPU host: aggregate the dedicated VRAM of all cards. Per-GPU
+      // detail stays in _lastVramLines for the gpus[] array.
+      const sums = vramLines.reduce(
+        (acc, l) => ({
+          used: acc.used + (l.used ?? 0),
+          total: acc.total + (l.total ?? 0),
+          anyNonNull: acc.anyNonNull || l.used != null || l.total != null,
+        }),
+        { used: 0, total: 0, anyNonNull: false }
+      );
+      if (sums.anyNonNull) {
+        used = sums.used;
+        total = sums.total;
+      }
     }
 
     // Compute-apps sum is the reliable "used" path on unified-memory GB10.
@@ -367,6 +395,92 @@ export class SystemCollector {
     if (!t || /^\[?n\/a\]?$/i.test(t)) return null;
     const n = parseFloat(t);
     return Number.isFinite(n) ? n : null;
+  }
+
+  /**
+   * Parse every line of a per-GPU nvidia-smi query into one entry per card.
+   * Single-GPU boxes return a one-element array — same values as _parseGpuLine.
+   */
+  _parseGpuLinesAll(output) {
+    const lines = (output || "").trim().split("\n").filter(Boolean);
+    return lines.map((line) => {
+      const parts = line.split(",").map((s) => s.trim());
+      return {
+        temperature: parseFloat(parts[0]) || 0,
+        usage: parseFloat(parts[1]) || 0,
+        powerDraw: parseFloat(parts[2]) || 0,
+        powerLimit: this._parseSmiNumber(parts[3]) ?? 120,
+        smClockMHz: this._parseSmiNumber(parts[4]),
+        smClockMaxMHz: this._parseSmiNumber(parts[5]),
+        throttle: this._buildThrottle({
+          hwThermal: this._parseSmiActive(parts[6]),
+          swThermal: this._parseSmiActive(parts[7]),
+          hwSlowdown: this._parseSmiActive(parts[8]),
+          powerCap: this._parseSmiActive(parts[9]),
+          smClockMHz: this._parseSmiNumber(parts[4]),
+          smClockMaxMHz: this._parseSmiNumber(parts[5]),
+        }),
+      };
+    });
+  }
+
+  /** Zip per-GPU field lines with per-GPU memory lines into the snapshot gpus[] shape. */
+  _assembleGpuArray(gpuLines, vramLines) {
+    if (gpuLines.length <= 1 && (vramLines?.length ?? 0) <= 1) return gpuLines.length === 1 ? [{
+      index: 0,
+      temperature: gpuLines[0].temperature,
+      usage: gpuLines[0].usage,
+      power: { draw: gpuLines[0].powerDraw, limit: gpuLines[0].powerLimit },
+      vram: null,
+      throttle: gpuLines[0].throttle ?? null,
+    }] : [];
+    const out = [];
+    for (let i = 0; i < gpuLines.length; i++) {
+      const g = gpuLines[i];
+      const v = vramLines?.[i];
+      const hasVram = v && (v.used != null || v.total != null);
+      const vUsed = Math.round(v?.used ?? 0);
+      const vTotal = Math.round(v?.total ?? 0);
+      out.push({
+        index: i,
+        temperature: g.temperature,
+        usage: g.usage,
+        power: { draw: g.powerDraw, limit: g.powerLimit },
+        vram: hasVram
+          ? {
+              used: vUsed,
+              total: vTotal,
+              percentage: vTotal > 0 ? Math.round((vUsed / vTotal) * 100) : 0,
+              available: Math.max(0, vTotal - vUsed),
+            }
+          : null,
+        throttle: g.throttle ?? null,
+      });
+    }
+    return out;
+  }
+
+  /** Aggregate per-GPU lines into the legacy single-summary shape (worst temp/usage, summed power). */
+  _aggregateGpuLines(gpuLines) {
+    if (!gpuLines.length) {
+      return {
+        temperature: 0,
+        usage: 0,
+        powerDraw: 0,
+        powerLimit: 120,
+        throttle: this._defaultThrottle(),
+      };
+    }
+    if (gpuLines.length === 1) return gpuLines[0];
+    return {
+      temperature: Math.max(...gpuLines.map((g) => g.temperature)),
+      usage: Math.max(...gpuLines.map((g) => g.usage)),
+      powerDraw: gpuLines.reduce((sum, g) => sum + g.powerDraw, 0),
+      powerLimit: gpuLines.reduce((sum, g) => sum + g.powerLimit, 0),
+      smClockMHz: gpuLines[0].smClockMHz,
+      smClockMaxMHz: gpuLines[0].smClockMaxMHz,
+      throttle: gpuLines.find((g) => g.throttle?.active)?.throttle ?? gpuLines[0].throttle,
+    };
   }
 
   _parseGpuLine(output) {
@@ -1021,15 +1135,39 @@ export class SystemCollector {
       const computeOut = sections[2]?.trim() || "";
       const meminfoOut = sections[3]?.trim() || "";
 
-      const gpu = this._parseGpuLine(gpuOut);
+      const gpuLines = this._parseGpuLinesAll(gpuOut);
+      const gpu = this._aggregateGpuLines(gpuLines);
 
-      // Parse memory.used / memory.total from nvidia-smi (may be [N/A] on GB10)
+      // Parse memory.used / memory.total from nvidia-smi, one line per GPU
+      // (may be [N/A] on GB10). Aggregate for the legacy summary; keep the
+      // per-card lines for the gpus[] array.
+      const vramLines = memFields
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => {
+          const p = line.split(",").map((s) => s.trim());
+          return { used: this._parseSmiNumber(p[0]), total: this._parseSmiNumber(p[1]) };
+        });
       let used = null;
       let total = null;
-      const memLine = memFields.split("\n").filter(Boolean)[0] || "";
-      const memParts = memLine.split(",").map((s) => s.trim());
-      used = this._parseSmiNumber(memParts[0]);
-      total = this._parseSmiNumber(memParts[1]);
+      if (vramLines.length === 1) {
+        used = vramLines[0].used;
+        total = vramLines[0].total;
+      } else if (vramLines.length > 1) {
+        const sums = vramLines.reduce(
+          (acc, l) => ({
+            used: acc.used + (l.used ?? 0),
+            total: acc.total + (l.total ?? 0),
+            anyNonNull: acc.anyNonNull || l.used != null || l.total != null,
+          }),
+          { used: 0, total: 0, anyNonNull: false }
+        );
+        if (sums.anyNonNull) {
+          used = sums.used;
+          total = sums.total;
+        }
+      }
+      const gpus = this._assembleGpuArray(gpuLines, vramLines);
 
       const apps = this._parseComputeApps(computeOut);
       this.nvidiaComputeAppsCache.clear();
@@ -1076,6 +1214,7 @@ export class SystemCollector {
         usage: gpu.usage,
         power: { draw: gpu.powerDraw, limit: gpu.powerLimit, systemDraw },
         vram: { used: usedMB, total: totalMB, percentage, available: availableMB },
+        gpus,
         processes,
         throttle: gpu.throttle,
         nvErrNoMemory: await this._nvErrNoMemory(),
@@ -1633,6 +1772,7 @@ export class SystemCollector {
       usage: 0,
       power: { draw: 0, limit: 120, systemDraw: 0 },
       vram: { used: 0, total: 0, percentage: 0, available: 0 },
+      gpus: [],
       processes: [],
       throttle: this._defaultThrottle(),
       nvErrNoMemory: 0,

@@ -10,3 +10,11 @@ node_modules/
 
 # Don't skip server/ or config/ in Docker build
 # They are needed at runtime
+# Runtime state written by the container (root-owned 600) — never build inputs,
+# keep out of the build context (build-context trap, verified 2026-09-26).
+config/bench-active.json
+config/prefill-bench-active.json
+config/fleet-energy.json
+config/llm-daily.json
+config/showcase-history.json
+config/ssh/
