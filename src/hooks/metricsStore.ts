@@ -119,11 +119,11 @@ export function ingestSnapshots(sparks: SparkSnapshot[], at = Date.now()): void 
     if (m.gpu) {
       pushHistory(`${s.id}:gpu.usage`, m.gpu.usage, at);
       pushHistory(`${s.id}:gpu.temp`, m.gpu.temperature, at);
-      // Per-device series when the unit exposes more than one physical GPU.
+      // Per-card series for multi-GPU hosts (keyed by nvidia-smi index).
       if (Array.isArray(m.gpu.gpus) && m.gpu.gpus.length > 1) {
-        for (const g of m.gpu.gpus) {
-          pushHistory(`${s.id}:gpu${g.index}.usage`, g.usage, at);
-          pushHistory(`${s.id}:gpu${g.index}.temp`, g.temperature, at);
+        for (const d of m.gpu.gpus) {
+          pushHistory(`${s.id}:gpu.${d.index}.usage`, d.usage, at);
+          pushHistory(`${s.id}:gpu.${d.index}.temp`, d.temperature, at);
         }
       }
     }

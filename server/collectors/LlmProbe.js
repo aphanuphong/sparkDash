@@ -66,7 +66,7 @@ export class LlmProbe {
     this.baseUrl = `http://${llmProbeHost(spark)}:${port}`;
 
     // State
-    this.backendType = null; // 'vllm' | 'llama.cpp' | 'sglang' | 'ds4' | 'exl3' | 'q27' | 'dgpp' | null
+    this.backendType = null; // 'vllm' | 'llama.cpp' | 'sglang' | 'ds4' | 'exl3' | 'q27' | 'tensorfold' | 'dgpp' | null
     this.serverIsOpenAI = null; // true = OpenAI-compatible
     /** Whether /v1/models (or /slots) answered without credentials. null = unknown. */
     this.authOpen = null;
@@ -103,6 +103,14 @@ export class LlmProbe {
 
     // Cumulative total output tokens (generation) as reported by the LLM server
     this.totalOutputTokens = 0;
+    /** Cumulative total prompt (prefill) tokens as reported by the LLM server. */
+    this.totalPromptTokens = null;
+    /**
+     * Cumulative cached (prefix-cache served) prompt tokens, when the backend
+     * reports the split. Subset of totalPromptTokens (for ds4/q27 the raw
+     * prefill counter is computed-only, so prompt = computed + cached).
+     */
+    this.totalCachedTokens = null;
 
     // vLLM inference metrics from /metrics (null when not vLLM / missing series)
     // Metric names follow stock vLLM Prometheus exposition (versions may differ).
@@ -256,6 +264,8 @@ export class LlmProbe {
     this.slotsActive = 0;
     this.slotsTotal = 0;
     this.totalOutputTokens = 0;
+    this.totalPromptTokens = null;
+    this.totalCachedTokens = null;
     this.kvCacheUsage = null;
     this.requestsRunning = null;
     this.requestsWaiting = null;
@@ -304,6 +314,7 @@ export class LlmProbe {
       this.backendType !== "ds4" &&
       this.backendType !== "exl3" &&
       this.backendType !== "q27" &&
+      this.backendType !== "tensorfold" &&
       this.backendType !== "dgpp"
     ) {
       const slotUrl = `${this.baseUrl}/slots`;
@@ -351,9 +362,9 @@ export class LlmProbe {
   }
 
   /**
-   * Classify an OpenAI-compatible server: ds4, SGLang, EXL3, q27, DGPP, or vLLM (default).
+   * Classify an OpenAI-compatible server: ds4, SGLang, EXL3, q27, TensorFold, DGPP, or vLLM (default).
    * @param {unknown} ownedBy
-   * @returns {Promise<"ds4" | "sglang" | "exl3" | "q27" | "dgpp" | "vllm">}
+   * @returns {Promise<"ds4" | "sglang" | "exl3" | "q27" | "tensorfold" | "dgpp" | "vllm">}
    */
   async _classifyOpenAIBackend(ownedBy) {
     if (typeof ownedBy === "string") {
@@ -362,6 +373,8 @@ export class LlmProbe {
       if (/exl3/i.test(ownedBy)) return "exl3";
       // q27's /v1/models reports owned_by: "q27" (signalnine/q27 engine).
       if (/q27/i.test(ownedBy)) return "q27";
+      // TensorFold (ashhart/TensorFold) reports owned_by: "tensorfold" on both MLX and CUDA servers.
+      if (/tensorfold/i.test(ownedBy)) return "tensorfold";
       // DGPP dgpp-serve reports owned_by: "dgpp".
       if (/dgpp/i.test(ownedBy)) return "dgpp";
     }
@@ -518,6 +531,8 @@ export class LlmProbe {
         this.backendType = "sglang";
       } else if (/exl3/i.test(owned) && this.backendType !== "ds4") {
         this.backendType = "exl3";
+      } else if (/tensorfold/i.test(owned) && this.backendType !== "ds4") {
+        this.backendType = "tensorfold";
       } else if (/dgpp/i.test(owned)) {
         this.backendType = "dgpp";
       }
@@ -539,6 +554,23 @@ export class LlmProbe {
       if (dgppData) this._applyDgppMetrics(dgppData, dtSec);
       // Weights resident, no sleep state — ready whenever the server answers.
       if (this.gpuMemoryUtilization == null) this.gpuMemoryUtilization = 1;
+      return this._getSnapshot();
+    }
+
+    // TensorFold: no Prometheus. /health carries cumulative token totals when the
+    // server publishes them; without them tok/s stays 0 rather than guessing.
+    if (this.backendType === "tensorfold") {
+      try {
+        const healthRes = await this._fetch(`${this.baseUrl}/health`);
+        if (healthRes.ok) {
+          const health = await healthRes.json().catch(() => null);
+          this._applyTensorFoldHealth(health, dtSec);
+        } else {
+          this._applyTensorFoldHealth(null, dtSec);
+        }
+      } catch {
+        this._applyTensorFoldHealth(null, dtSec);
+      }
       return this._getSnapshot();
     }
 
@@ -663,6 +695,13 @@ export class LlmProbe {
       computedPrefill ?? this._getPromMetric(txt, "ds4_tokens_prefilled_total");
     const inflightHint = this._getPromMetric(txt, "ds4_requests_inflight");
     const inflight = inflightHint != null && inflightHint > 0;
+    // Cumulative cached prefill for the token ledger (kind="cached" label).
+    const cachedTotal = this._getPromMetricLabeled(
+      txt,
+      "ds4_tokens_prefilled_total",
+      "kind",
+      "cached"
+    );
 
     if (decoded != null) {
       if (prefilled != null && dtSec > 0 && dtSec < 10) {
@@ -678,6 +717,15 @@ export class LlmProbe {
       if (prefilled != null) this.lastTokenCounts.input = prefilled;
       this.lastTokenCounts.output = decoded;
       this.totalOutputTokens = decoded;
+      // ds4's prefill counter is COMPUTED-only when the kind labels exist;
+      // the token ledger wants the full prompt, so add the cached share.
+      if (prefilled != null) {
+        this.totalPromptTokens =
+          cachedTotal != null && computedPrefill != null
+            ? prefilled + cachedTotal
+            : prefilled;
+      }
+      if (cachedTotal != null) this.totalCachedTokens = cachedTotal;
     } else {
       // No counters — fall back to window gauges only while something is in flight
       const gaugeGen = this._getPromMetric(txt, "ds4_decode_tok_s");
@@ -774,6 +822,15 @@ export class LlmProbe {
       if (computed != null) this.lastTokenCounts.input = computed;
       this.lastTokenCounts.output = decoded;
       this.totalOutputTokens = decoded;
+      // q27's prefill counter is computed-only; the token ledger wants the
+      // full prompt (computed + cached).
+      const cachedTok =
+        this._getPromMetric(txt, "q27_prefill_cached_tokens_processed_total") ??
+        this._getPromMetric(txt, "q27_prefill_cached_tokens_total");
+      if (computed != null) {
+        this.totalPromptTokens = cachedTok != null ? computed + cachedTok : computed;
+      }
+      if (cachedTok != null) this.totalCachedTokens = cachedTok;
     }
 
     const inflight = this._getPromMetric(txt, "q27_requests_inflight");
@@ -884,6 +941,26 @@ export class LlmProbe {
     if (Number.isFinite(prompt)) this.lastTokenCounts.input = prompt;
     this.lastTokenCounts.output = completion;
     this.totalOutputTokens = completion;
+    if (Number.isFinite(prompt)) this.totalPromptTokens = prompt;
+  }
+
+  /**
+   * Apply TensorFold GET /health. Same counter contract as EXL3 (`prompt_tokens_total`,
+   * `completion_tokens_total`, optional `busy` / `context_length`). The MLX server's
+   * `max_batch_size` sizes the slot tile; the CUDA server's `{ok: true}` has no counters,
+   * so rates read 0 instead of a made-up number.
+   * @param {Record<string, unknown> | null} data
+   * @param {number} dtSec
+   */
+  _applyTensorFoldHealth(data, dtSec) {
+    const health = data && typeof data === "object" && !Array.isArray(data) ? data : {};
+    this._applyExl3Health(health, dtSec);
+    // TensorFold 0.5.0 (cuda/health.py) publishes cumulative cached prompt tokens
+    // alongside the EXL3-style counters; older builds omit it (stays null).
+    const cached = Number(health.cached_tokens_total);
+    if (Number.isFinite(cached) && cached >= 0) this.totalCachedTokens = cached;
+    const batch = Number(health.max_batch_size);
+    if (Number.isFinite(batch) && batch > 0) this.slotsTotal = Math.round(batch);
   }
 
   /**
@@ -902,6 +979,12 @@ export class LlmProbe {
       this.lastTokenCounts.input = promptTokens;
       this.lastTokenCounts.output = genTokens;
       this.totalOutputTokens = genTokens;
+      this.totalPromptTokens = promptTokens;
+      // vLLM prefix-cache counters are token-granular (queries += prompt
+      // tokens/request, hits += tokens served from cache), so cached_tokens
+      // is directly the cumulative cached share of the prompt.
+      const cachedTok = this._getVllmMetric(txt, "prefix_cache_hits_total");
+      if (cachedTok != null) this.totalCachedTokens = cachedTok;
       const ttftSum = this._getVllmMetric(txt, "time_to_first_token_seconds_sum");
       const deltaIter =
         iterSum != null && this.lastIterSum != null ? iterSum - this.lastIterSum : 0;
@@ -1119,6 +1202,10 @@ export class LlmProbe {
 
     const inTok = sgData.total_input_tokens;
     const outTok = sgData.total_output_tokens;
+    // Newer SGLang builds expose total_cached_tokens (radix/prefix cache
+    // served) next to the totals; older ones fall back to Prometheus.
+    const cachedNum = Number(sgData.total_cached_tokens);
+    const sgCached = Number.isFinite(cachedNum) && cachedNum >= 0 ? cachedNum : null;
     if (inTok != null && outTok != null) {
       const input = Number(inTok);
       const output = Number(outTok);
@@ -1128,6 +1215,8 @@ export class LlmProbe {
         this.lastTokenCounts.input = input;
         this.lastTokenCounts.output = output;
         this.totalOutputTokens = output;
+        this.totalPromptTokens = input;
+        if (sgCached != null) this.totalCachedTokens = sgCached;
         this._sglangTotalsPolled = true;
         this._sglangTokenSource = "server_info";
         if (dtSec > 0 && dtSec < 10) {
@@ -1325,6 +1414,29 @@ export class LlmProbe {
   }
 
   /**
+   * Cumulative prefill tokens that actually did compute (cache misses).
+   * Prefers the per-mode counters; falls back to prompt − cached when only the
+   * plain prompt counter exists. Kept separate from prompt_tokens_total, which
+   * also counts cache-served tokens (the bulk of a warm session).
+   * @param {string} txt
+   * @returns {number | null}
+   */
+  _sglangPrefillComputeTokens(txt) {
+    const direct =
+      this._getPromMetricLabeled(txt, "sglang:realtime_tokens_total", "mode", "prefill_compute") ??
+      this._getPromMetricLabeled(txt, "sglang_realtime_tokens_total", "mode", "prefill_compute") ??
+      this._getPromMetricLabeled(txt, "sglang:prefill_effective_tokens_total", "mode", "input") ??
+      this._getPromMetricLabeled(txt, "sglang_prefill_effective_tokens_total", "mode", "input");
+    if (direct != null) return direct;
+    const prompt =
+      this._getPromMetric(txt, "sglang:prompt_tokens_total") ??
+      this._getPromMetric(txt, "sglang_prompt_tokens_total");
+    const cached = this._sglangCachedTokens(txt);
+    if (prompt != null && cached != null) return Math.max(0, prompt - cached);
+    return null;
+  }
+
+  /**
    * Apply SGLang Prometheus /metrics (--enable-metrics).
    * Supports both `sglang:` and `sglang_` prefixes.
    * @param {string} txt
@@ -1352,6 +1464,14 @@ export class LlmProbe {
       return;
     }
 
+    // Prefill accounting: the tile counts every prompt token taken in this
+    // window — cache-served + computed — and the split rows below break it
+    // down. The per-mode counters are exact; prompt_tokens_total alone cannot
+    // tell the two apart (it also folds in host/storage hits), so it is the
+    // fallback for builds without the realtime series.
+    const prefillCompute = this._sglangPrefillComputeTokens(txt);
+    const cached = this._sglangCachedTokens(txt);
+
     // Difference only against our own baseline; after a server-info hand-off
     // the first sample seeds instead of reporting the gap between two series.
     const ownsBaseline = this._sglangTokenSource !== "server_info";
@@ -1369,10 +1489,11 @@ export class LlmProbe {
       } else {
         this.generationTps = Math.max(0, Math.round((deltaOut / dtSec) * 100) / 100);
       }
-      if (prompt != null) {
+      if (prefillCompute == null && prompt != null) {
+        // No per-mode counters: the prompt counter is the only total we have.
         const deltaIn = prompt - this.lastTokenCounts.input;
-        this._setPrefillTps(deltaIn / dtSec, deltaOut > 0);
-      } else if (deltaOut <= 0) {
+        this.prefillTps = Math.max(0, Math.round((deltaIn / dtSec) * 100) / 100);
+      } else if (prefillCompute == null && deltaOut <= 0) {
         this.prefillTps = 0;
       }
     }
@@ -1383,10 +1504,25 @@ export class LlmProbe {
     if (prompt != null) this.lastTokenCounts.input = prompt;
     this._sglangTokenSource = "prometheus";
     this.totalOutputTokens = gen;
+    this.totalPromptTokens = prompt ?? null;
+    // Cached share from the same exposition (device layer preferred).
+    const cachedNow = this._sglangCachedTokens(txt);
+    if (cachedNow != null) this.totalCachedTokens = cachedNow;
 
-    const cached = this._sglangCachedTokens(txt);
-    if (cached != null && prompt != null) {
-      this._setPrefillSplitRates(cached, prompt, dtSec);
+    // The tile reads cache-served + computed; the split rows below show the
+    // two parts. Poll-window rates, not latches: a window that prefilled
+    // nothing reads 0 even while unrelated requests are still decoding
+    // (holding the last value here kept a stale number on screen for hours).
+    if (prefillCompute != null && cached != null) {
+      this._setPrefillSplitRates(cached, prefillCompute, dtSec);
+      if (
+        canDiff &&
+        this.uncachedPrefillTps != null &&
+        this.cachedPrefillTps != null
+      ) {
+        const total = this.uncachedPrefillTps + this.cachedPrefillTps;
+        this.prefillTps = Math.max(0, Math.round(total * 100) / 100);
+      }
     }
   }
 
@@ -1395,17 +1531,18 @@ export class LlmProbe {
    * Prefers cache_source="device" so HiCache L1/L2/L3 labels are not summed.
    */
   _applySglangPrefillSplit(txt, dtSec) {
-    const prompt =
-      this._getPromMetric(txt, "sglang:prompt_tokens_total") ??
-      this._getPromMetric(txt, "sglang_prompt_tokens_total");
+    const compute = this._sglangPrefillComputeTokens(txt);
     const cached = this._sglangCachedTokens(txt);
-    if (cached != null && prompt != null) {
-      this._setPrefillSplitRates(cached, prompt, dtSec);
+    if (cached != null) this.totalCachedTokens = cached;
+    if (compute != null && cached != null) {
+      this._setPrefillSplitRates(cached, compute, dtSec);
     }
   }
 
   _sglangCachedTokens(txt) {
     return (
+      this._getPromMetricLabeled(txt, "sglang:realtime_tokens_total", "mode", "prefill_cache") ??
+      this._getPromMetricLabeled(txt, "sglang_realtime_tokens_total", "mode", "prefill_cache") ??
       this._getPromMetricLabeled(txt, "sglang:cached_tokens_total", "cache_source", "device") ??
       this._getPromMetricLabeled(txt, "sglang_cached_tokens_total", "cache_source", "device") ??
       this._getPromMetricMax(txt, "sglang:cached_tokens_total") ??
@@ -1481,6 +1618,8 @@ export class LlmProbe {
           }
 
           this.totalOutputTokens = totalDecoded;
+          this.totalPromptTokens = promptedSum;
+          if (sawCache) this.totalCachedTokens = cachedSum;
           this.generationTps = Math.max(0, Math.round(totalGen * 100) / 100);
           this._setPrefillTps(totalPrefill, totalGen > 0);
           if (sawCache) this._setPrefillSplitRates(cachedSum, promptedSum, dtSec);
@@ -1754,6 +1893,8 @@ export class LlmProbe {
       cachedPrefillTps: this.cachedPrefillTps,
       uncachedPrefillTps: this.uncachedPrefillTps,
       totalOutputTokens: this.totalOutputTokens,
+      totalPromptTokens: this.totalPromptTokens ?? null,
+      totalCachedTokens: this.totalCachedTokens ?? null,
       kvCacheUsage: this.kvCacheUsage,
       requestsRunning: this.requestsRunning,
       requestsWaiting: this.requestsWaiting,
@@ -1784,6 +1925,7 @@ export class LlmProbe {
       cachedPrefillTps: null,
       uncachedPrefillTps: null,
       totalOutputTokens: 0,
+      totalCachedTokens: null,
       kvCacheUsage: null,
       requestsRunning: null,
       requestsWaiting: null,
